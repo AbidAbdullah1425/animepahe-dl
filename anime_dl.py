@@ -59,6 +59,12 @@ class AnimePaheDownloader:
         connector = aiohttp.TCPConnector(ssl=ssl_context, force_close=True)
         self.session = aiohttp.ClientSession(headers=headers, connector=connector)
 
+    async def close(self):
+        """Close the session"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+
     def print_info(self, message: str):
         """Print info message"""
         if not self.list_only:
@@ -73,7 +79,7 @@ class AnimePaheDownloader:
         """Print error message and exit"""
         print(f"\033[31m[ERROR]\033[0m {message}")
         raise SystemExit(1)
-
+        
     async def search_anime(self, query: str) -> List[Dict]:
         """Search for anime using the API"""
         try:
@@ -185,32 +191,66 @@ class AnimePaheDownloader:
         try:
             headers = {
                 "User-Agent": self.user_agent,
-                "Referer": self.host
+                "Referer": self.host,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Connection": "keep-alive",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin"
             }
             
             async with self.session.get(kwik_url, headers=headers) as resp:
                 if resp.status != 200:
+                    if self.debug_mode:
+                        self.print_warn(f"Failed to get kwik page: Status {resp.status}")
                     return None
                 html = await resp.text()
+                
+                if self.debug_mode:
+                    self.print_info(f"Got kwik page response: {len(html)} bytes")
 
             # Extract and process javascript
-            script = re.search(r'<script>(eval.*?)</script>', html, re.DOTALL)
-            if not script:
-                return None
+            scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+            for script in scripts:
+                if 'eval(' in script:
+                    try:
+                        # Clean up the javascript
+                        js_code = script.strip()
+                        if js_code.startswith('eval('):
+                            js_code = js_code[5:-1]  # Remove eval( and )
+                        
+                        # Replace problematic elements
+                        js_code = js_code.replace('document.', 'window.')
+                        js_code = js_code.replace('window.querySelector', '() => null')
+                        js_code = js_code.replace('navigator.', '{"userAgent":"' + self.user_agent + '"}.')
+                        
+                        # Add window object
+                        js_code = f"""
+                        const window = {{
+                            innerWidth: 1920,
+                            innerHeight: 1080,
+                            querySelector: () => null
+                        }};
+                        {js_code}
+                        """
+                        
+                        # Execute javascript
+                        import nodejs
+                        result = nodejs.eval(js_code)
+                        
+                        # Look for m3u8 URL
+                        m3u8_matches = re.findall(r'(https?://[^\'"]*\.m3u8)', result)
+                        if m3u8_matches:
+                            return m3u8_matches[0]
+                            
+                    except Exception as js_error:
+                        if self.debug_mode:
+                            self.print_warn(f"Javascript evaluation failed: {str(js_error)}")
+                        continue
 
-            # Process javascript to get the source URL
-            js_code = script.group(1)
-            js_code = js_code.replace('document', 'process')
-            js_code = js_code.replace('querySelector', 'exit')
-            
-            # Execute javascript to get m3u8 link
-            import nodejs
-            result = nodejs.eval(js_code)
-            
-            # Extract m3u8 URL
-            m3u8_url = re.search(r"source='(.*?\.m3u8)'", result)
-            if m3u8_url:
-                return m3u8_url.group(1)
+            if self.debug_mode:
+                self.print_warn("No valid m3u8 URL found")
             return None
 
         except Exception as e:
@@ -230,9 +270,13 @@ class AnimePaheDownloader:
 
             # Get m3u8 playlist
             self.print_info("Getting playlist...")
+            if self.debug_mode:
+                self.print_info(f"Trying to get playlist from: {link}")
             playlist_url = await self.get_playlist_link(link)
             if not playlist_url:
                 self.print_warn("Failed to get playlist")
+                if self.debug_mode:
+                    self.print_info("Try running with -d flag for more debug info")
                 return
 
             if self.list_only:
@@ -247,7 +291,9 @@ class AnimePaheDownloader:
             
         except Exception as e:
             if self.debug_mode:
-                self.print_warn(f"Failed to download episode: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            self.print_warn(f"Failed to download episode: {str(e)}")
 
     async def download_m3u8(self, playlist_url: str, output_file: Path):
         """Download and process m3u8 playlist"""
@@ -399,4 +445,4 @@ async def main():
         await downloader.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())            
+    asyncio.run(main())        
